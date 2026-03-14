@@ -6,6 +6,11 @@ import {
 } from "@solana/wallet-adapter-react";
 import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
 
+import {
+  PhantomWalletAdapter,
+  SolflareWalletAdapter,
+} from "@solana/wallet-adapter-wallets";
+
 import App from "./App";
 import "./index.css";
 import "@solana/wallet-adapter-react-ui/styles.css";
@@ -13,13 +18,16 @@ import "@solana/wallet-adapter-react-ui/styles.css";
 const endpoint = "https://api.devnet.solana.com";
 
 const Root = () => {
-  const wallets = useMemo(() => [], []);
+  const wallets = useMemo(
+    () => [new PhantomWalletAdapter(), new SolflareWalletAdapter()],
+    [],
+  );
 
   return (
     <ConnectionProvider endpoint={endpoint}>
       <WalletProvider
         wallets={wallets}
-        autoConnect={true}
+        autoConnect
         localStorageKey="aegis-wallet"
       >
         <WalletModalProvider>
