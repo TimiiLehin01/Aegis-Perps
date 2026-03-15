@@ -7,8 +7,6 @@ import type { TradeFormProps, Side, LevMultiple, OrderType } from "@/types";
 
 const ORDER_TYPES: OrderType[] = ["MARKET", "LIMIT", "STOP"];
 const LEVERAGES: LevMultiple[] = [1, 2, 5, 10, 25];
-
-// Height of the pinned execute button area
 const BTN_AREA_H = 64;
 
 const TradeForm: FC<TradeFormProps> = ({
@@ -17,16 +15,20 @@ const TradeForm: FC<TradeFormProps> = ({
   walletConnected,
 }) => {
   const { setVisible } = useWalletModal();
-  const { connecting, publicKey } = useWallet();
+  const { connecting, publicKey, signMessage } = useWallet();
   const { connection } = useConnection();
+
   const [solBalance, setSolBalance] = useState<number | null>(null);
   const [balanceTick, setBalanceTick] = useState(0);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!publicKey || !walletConnected) {
       setSolBalance(null);
       return;
     }
+
     connection
       .getBalance(publicKey)
       .then((l) => setSolBalance(l / 1e9))
@@ -48,50 +50,134 @@ const TradeForm: FC<TradeFormProps> = ({
   const fee = notional * 0.0002;
   const isLong = side === "LONG";
   const balanceUsd = solBalance !== null ? solBalance * market.price : null;
+
   const insufficient =
     walletConnected &&
     sizeNum > 0 &&
     balanceUsd !== null &&
     margin > balanceUsd;
+
   const canExecute =
-    walletConnected && sizeNum > 0 && !insufficient && !connecting;
+    walletConnected &&
+    sizeNum > 0 &&
+    !insufficient &&
+    !connecting &&
+    !isSubmitting;
 
-  const btnBg = connecting
-    ? "#1a1b1e"
-    : !walletConnected
-      ? "rgba(255,255,255,0.06)"
-      : insufficient
-        ? "rgba(244,63,94,0.15)"
-        : sizeNum <= 0
-          ? "rgba(255,255,255,0.04)"
-          : isLong
-            ? "#10b981"
-            : "#f43f5e";
+  const btnBg =
+    connecting || isSubmitting
+      ? "#1a1b1e"
+      : !walletConnected
+        ? "rgba(255,255,255,0.06)"
+        : insufficient
+          ? "rgba(244,63,94,0.15)"
+          : sizeNum <= 0
+            ? "rgba(255,255,255,0.04)"
+            : isLong
+              ? "#10b981"
+              : "#f43f5e";
 
-  const btnColor = connecting
-    ? "#52525b"
-    : !walletConnected
-      ? "#6a7a9a"
-      : insufficient
-        ? "#f43f5e"
-        : sizeNum <= 0
-          ? "#3f3f46"
-          : isLong
-            ? "#000"
-            : "#fff";
+  const btnColor =
+    connecting || isSubmitting
+      ? "#a1a1aa"
+      : !walletConnected
+        ? "#6a7a9a"
+        : insufficient
+          ? "#f43f5e"
+          : sizeNum <= 0
+            ? "#3f3f46"
+            : isLong
+              ? "#000"
+              : "#fff";
 
   const btnLabel = connecting
     ? "Handshaking..."
-    : !walletConnected
-      ? "⚡ Connect Wallet"
-      : insufficient
-        ? "Insufficient Balance"
-        : sizeNum <= 0
-          ? "Enter Size"
-          : `Open ${side} · ${lev}x`;
+    : isSubmitting
+      ? "Awaiting Signature..."
+      : !walletConnected
+        ? "⚡ Connect Wallet"
+        : insufficient
+          ? "Insufficient Balance"
+          : sizeNum <= 0
+            ? "Enter Size"
+            : `Open ${side} · ${lev}x`;
+
+  const buildTradeMessage = () => {
+    const entryPrice =
+      otype === "MARKET"
+        ? market.price
+        : parseFloat(lxPx || "0") || market.price;
+
+    return [
+      "Aegis Private Perps Trade Authorization",
+      `Market: ${market.id}`,
+      `Side: ${side}`,
+      `Order Type: ${otype}`,
+      `Size: ${sizeNum}`,
+      `Leverage: ${lev}x`,
+      `Entry Price: ${f2(entryPrice)}`,
+      `Take Profit: ${tp || "None"}`,
+      `Stop Loss: ${sl || "None"}`,
+      `Timestamp: ${new Date().toISOString()}`,
+    ].join("\n");
+  };
+
+  const handleExecute = async () => {
+    setSubmitError(null);
+
+    if (!walletConnected) {
+      setVisible(true);
+      return;
+    }
+
+    if (!canExecute) return;
+
+    try {
+      setIsSubmitting(true);
+
+      if (!publicKey) {
+        throw new Error("Wallet public key not found.");
+      }
+
+      if (!signMessage) {
+        throw new Error(
+          "This wallet does not support message signing. Please use a wallet that supports signing.",
+        );
+      }
+
+      const message = buildTradeMessage();
+      const encoded = new TextEncoder().encode(message);
+
+      // This triggers the wallet signature popup
+      const signature = await signMessage(encoded);
+
+      if (!signature) {
+        throw new Error("Signature was not completed.");
+      }
+
+      await onExecute(
+        side,
+        sizeNum,
+        lev,
+        tp ? parseFloat(tp) : undefined,
+        sl ? parseFloat(sl) : undefined,
+      );
+
+      setSize("");
+      setTp("");
+      setSl("");
+      setTimeout(() => setBalanceTick((n) => n + 1), 1500);
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "Trade execution failed.";
+      setSubmitError(msg);
+      console.error("Trade execution/signing error:", err);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
 
   return (
-    // Outer: fills whatever height the parent gives it, position:relative for the pinned button
     <div
       style={{
         backgroundColor: "#0c0d10",
@@ -103,16 +189,14 @@ const TradeForm: FC<TradeFormProps> = ({
         overflow: "hidden",
       }}
     >
-      {/* Scrollable area — padded at the bottom so content clears the pinned button */}
       <div
         style={{
           flex: 1,
           overflowY: "auto",
-          paddingBottom: `${BTN_AREA_H + 8}px`,
+          paddingBottom: `${BTN_AREA_H + 28}px`,
           minHeight: 0,
         }}
       >
-        {/* LONG / SHORT */}
         <div style={{ padding: "10px 16px 0" }}>
           <div
             style={{
@@ -159,7 +243,6 @@ const TradeForm: FC<TradeFormProps> = ({
         </div>
 
         <div style={{ padding: "12px 16px 0" }}>
-          {/* Order Type Tabs */}
           <div
             style={{
               display: "flex",
@@ -193,7 +276,6 @@ const TradeForm: FC<TradeFormProps> = ({
             ))}
           </div>
 
-          {/* Size */}
           <div style={{ marginBottom: "16px", position: "relative" }}>
             <div
               style={{
@@ -250,7 +332,7 @@ const TradeForm: FC<TradeFormProps> = ({
                 fontFamily: "IBM Plex Mono",
                 color: "#d8e2f0",
                 outline: "none",
-                boxSizing: "border-box" as const,
+                boxSizing: "border-box",
               }}
               placeholder="0.00"
             />
@@ -268,7 +350,6 @@ const TradeForm: FC<TradeFormProps> = ({
             </span>
           </div>
 
-          {/* Limit/Stop price */}
           {otype !== "MARKET" && (
             <div style={{ marginBottom: "16px", position: "relative" }}>
               <label
@@ -301,7 +382,7 @@ const TradeForm: FC<TradeFormProps> = ({
                   fontFamily: "IBM Plex Mono",
                   color: "#d8e2f0",
                   outline: "none",
-                  boxSizing: "border-box" as const,
+                  boxSizing: "border-box",
                 }}
               />
               <span
@@ -319,7 +400,6 @@ const TradeForm: FC<TradeFormProps> = ({
             </div>
           )}
 
-          {/* Leverage */}
           <div style={{ marginBottom: "20px" }}>
             <div
               style={{
@@ -383,7 +463,6 @@ const TradeForm: FC<TradeFormProps> = ({
             </div>
           </div>
 
-          {/* TP / SL */}
           <div style={{ marginBottom: "16px" }}>
             <button
               onClick={() => setShowTpSl((v) => !v)}
@@ -433,6 +512,7 @@ const TradeForm: FC<TradeFormProps> = ({
                 </span>
               )}
             </button>
+
             {showTpSl && (
               <div
                 style={{
@@ -475,10 +555,11 @@ const TradeForm: FC<TradeFormProps> = ({
                       fontFamily: "IBM Plex Mono",
                       color: "#d8e2f0",
                       outline: "none",
-                      boxSizing: "border-box" as const,
+                      boxSizing: "border-box",
                     }}
                   />
                 </div>
+
                 <div style={{ position: "relative" }}>
                   <label
                     style={{
@@ -513,7 +594,7 @@ const TradeForm: FC<TradeFormProps> = ({
                       fontFamily: "IBM Plex Mono",
                       color: "#d8e2f0",
                       outline: "none",
-                      boxSizing: "border-box" as const,
+                      boxSizing: "border-box",
                     }}
                   />
                 </div>
@@ -521,7 +602,6 @@ const TradeForm: FC<TradeFormProps> = ({
             )}
           </div>
 
-          {/* Order Info */}
           <div
             style={{
               backgroundColor: "rgba(0,0,0,0.4)",
@@ -577,14 +657,13 @@ const TradeForm: FC<TradeFormProps> = ({
         </div>
       </div>
 
-      {/* Execute button — absolutely pinned to bottom, always visible */}
       <div
         style={{
           position: "absolute",
           bottom: 0,
           left: 0,
           right: 0,
-          height: `${BTN_AREA_H}px`,
+          minHeight: `${BTN_AREA_H}px`,
           padding: "10px 16px",
           borderTop: "1px solid rgba(255,255,255,0.05)",
           backgroundColor: "#0c0d10",
@@ -603,25 +682,24 @@ const TradeForm: FC<TradeFormProps> = ({
             Insufficient — margin required: ${f2(margin)}
           </div>
         )}
+
+        {submitError && (
+          <div
+            style={{
+              fontSize: "10px",
+              color: "#f43f5e",
+              textAlign: "center",
+              marginBottom: "6px",
+              fontFamily: "IBM Plex Mono",
+            }}
+          >
+            {submitError}
+          </div>
+        )}
+
         <button
-          onClick={() => {
-            if (!walletConnected) {
-              setVisible(true);
-              return;
-            }
-            if (canExecute) {
-              onExecute(
-                side,
-                sizeNum,
-                lev,
-                tp ? parseFloat(tp) : undefined,
-                sl ? parseFloat(sl) : undefined,
-              );
-              setSize("");
-              setTimeout(() => setBalanceTick((n) => n + 1), 1500);
-            }
-          }}
-          disabled={connecting}
+          onClick={handleExecute}
+          disabled={connecting || isSubmitting}
           style={{
             width: "100%",
             height: "38px",
@@ -635,7 +713,10 @@ const TradeForm: FC<TradeFormProps> = ({
             transition: "all 150ms",
             backgroundColor: btnBg,
             color: btnColor,
-            opacity: sizeNum <= 0 && walletConnected && !insufficient ? 0.3 : 1,
+            opacity:
+              sizeNum <= 0 && walletConnected && !insufficient && !isSubmitting
+                ? 0.3
+                : 1,
             boxShadow: canExecute
               ? isLong
                 ? "0 0 30px -10px rgba(16,185,129,0.6)"

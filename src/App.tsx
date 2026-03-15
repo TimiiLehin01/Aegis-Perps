@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, type FC } from "react";
 import { MARKETS as BASE_MARKETS } from "@/data/markets";
 import { useLivePositions, useToast, usePythPrices, PYTH_IDS } from "@/hooks";
-import { getMxeStatus } from "@/lib/arcium";
+import { getMxeStatus, sealPosition } from "@/lib/arcium";
 
 import Navbar from "@/components/Navbar";
 import { Ticker, MarketBar } from "@/components/MarketBar";
@@ -17,8 +17,10 @@ import PortfolioPanel from "@/components/PortfolioPanel";
 import HistoryPanel from "@/components/HistoryPanel";
 import MarketsPanel from "@/components/MarketsPanel";
 
-import { useWallet } from "@solana/wallet-adapter-react";
+import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
+import { PublicKey } from "@solana/web3.js";
+import * as anchor from "@coral-xyz/anchor";
 
 import type {
   ActiveTab,
@@ -29,7 +31,6 @@ import type {
   Position,
 } from "@/types";
 
-// Map Pyth feed ID → our market ID
 const PYTH_TO_MARKET: Record<string, string> = {
   [PYTH_IDS.SOL.replace("0x", "")]: "SOL",
   [PYTH_IDS.ETH.replace("0x", "")]: "ETH",
@@ -38,18 +39,21 @@ const PYTH_TO_MARKET: Record<string, string> = {
   [PYTH_IDS.WIF.replace("0x", "")]: "WIF",
 };
 
+const PROGRAM_ID = new PublicKey(
+  import.meta.env.VITE_PROGRAM_ID ??
+    "8RK5m1rte3iKwJ2eJxoLXaxMmYyq3moAaTov72KqtgdG",
+);
+
 const App: FC = () => {
   const pythPrices = usePythPrices();
 
-  // Merge live Pyth prices into MARKETS
   const markets = useMemo<Market[]>(() => {
     return BASE_MARKETS.map((m) => {
       const liveEntry = Object.entries(pythPrices).find(
         ([id]) => PYTH_TO_MARKET[id] === m.id,
       );
       if (!liveEntry) return m;
-      const live = liveEntry[1];
-      return { ...m, price: live.price };
+      return { ...m, price: liveEntry[1].price };
     });
   }, [pythPrices]);
 
@@ -66,13 +70,12 @@ const App: FC = () => {
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("chart");
   const [mxeNodes, setMxeNodes] = useState(3);
   const [showDrawer, setShowDrawer] = useState(false);
-  const [isDesktop, setIsDesktop] = useState(() =>
-    typeof window !== "undefined" ? window.innerWidth >= 1024 : true,
-  );
 
   const wallet = useWallet();
+  const { connection } = useConnection();
   const { setVisible } = useWalletModal();
   const [toast, notify] = useToast();
+
   const {
     positions,
     closedTrades,
@@ -86,10 +89,8 @@ const App: FC = () => {
   }, []);
 
   const onResize = useCallback(() => {
-    setIsDesktop(window.innerWidth >= 1024);
     if (window.innerWidth >= 1024) setShowDrawer(false);
   }, []);
-
   useEffect(() => {
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -98,19 +99,57 @@ const App: FC = () => {
   const handleWalletToggle = () =>
     wallet.connected ? wallet.disconnect() : setVisible(true);
 
-  const handleExecute = (
+  const toU64LE = (n: number): Uint8Array => {
+    const buf = new Uint8Array(8);
+    let val = BigInt(n);
+    for (let i = 0; i < 8; i++) {
+      buf[i] = Number(val & 0xffn);
+      val >>= 8n;
+    }
+    return buf;
+  };
+
+  // Always build a fresh provider from current wallet + connection
+  const getProvider = useCallback(
+    () =>
+      new anchor.AnchorProvider(
+        connection,
+        wallet as unknown as anchor.Wallet,
+        { commitment: "confirmed" },
+      ),
+    [connection, wallet],
+  );
+
+  const handleExecute = async (
     side: Side,
     size: number,
     lev: LevMultiple,
     tp?: number,
     sl?: number,
   ) => {
-    if (!wallet.connected) {
+    if (!wallet.connected || !wallet.publicKey) {
       setVisible(true);
       return;
     }
-    addPosition(market, side, size, lev, tp, sl);
-    notify(`Private ${side} sealed. Arcium MXE encrypting your position.`);
+
+    try {
+      notify(`Encrypting position via Arcium MXE...`);
+      const provider = getProvider();
+      await sealPosition(provider, {
+        size,
+        leverage: lev,
+        side,
+        entryPrice: market.price,
+        market: market.pair,
+      });
+      addPosition(market, side, size, lev, tp, sl);
+      notify(`Private ${side} sealed via Arcium MXE.`);
+    } catch (err: any) {
+      console.error("sealPosition error:", err);
+      // Still add locally even if MXE seal fails
+      addPosition(market, side, size, lev, tp, sl);
+      notify(`Private ${side} opened (simulation mode).`);
+    }
   };
 
   const handleReveal = (posId: number) => {
@@ -121,14 +160,15 @@ const App: FC = () => {
     }
   };
 
-  const handleRevealDone = (posId: number) => {
+  const handleRevealDone = async (posId: number) => {
     revealPosition(posId);
     setRevealPos(null);
+    notify("PnL revealed.");
   };
 
   const handleClose = (posId: number) => {
     closePosition(posId);
-    notify("Position closed privately via Arcium MXE.");
+    notify("Position closed.");
   };
 
   const handleMobilePanel = (p: MobilePanel) => {
@@ -214,12 +254,25 @@ const App: FC = () => {
               height: "100%",
             }}
           >
-            <CandleChart market={market} positions={positions} />
-            <TradeForm
-              market={market}
-              onExecute={handleExecute}
-              walletConnected={wallet.connected}
-            />
+            {/* Chart: flex-1, TradeForm: fixed height */}
+            <div
+              style={{
+                flex: "0 0 60%",
+                overflow: "hidden",
+                position: "relative",
+              }}
+            >
+              <CandleChart market={market} />
+            </div>
+            <div
+              style={{ flex: "0 0 40%", position: "relative", minHeight: 0 }}
+            >
+              <TradeForm
+                market={market}
+                onExecute={handleExecute}
+                walletConnected={wallet.connected}
+              />
+            </div>
           </div>
           <div style={{ minHeight: 0, overflow: "hidden", height: "100%" }}>
             <PositionsPanel
@@ -236,7 +289,6 @@ const App: FC = () => {
           className="flex lg:hidden overflow-hidden"
           style={{ flex: 1, minHeight: 0, position: "relative" }}
         >
-          {/* Chart panel */}
           {mobilePanel === "chart" && (
             <div
               style={{
@@ -247,15 +299,27 @@ const App: FC = () => {
                 minHeight: 0,
               }}
             >
-              <CandleChart market={market} positions={positions} />
-              <TradeForm
-                market={market}
-                onExecute={handleExecute}
-                walletConnected={wallet.connected}
-              />
+              <div
+                style={{
+                  flex: "0 0 55%",
+                  overflow: "hidden",
+                  position: "relative",
+                }}
+              >
+                <CandleChart market={market} />
+              </div>
+              <div
+                style={{ flex: "0 0 45%", position: "relative", minHeight: 0 }}
+              >
+                <TradeForm
+                  market={market}
+                  onExecute={handleExecute}
+                  walletConnected={wallet.connected}
+                />
+              </div>
             </div>
           )}
-          {/* Form panel — no chart, just form */}
+
           {mobilePanel === "form" && (
             <div
               style={{
@@ -273,7 +337,7 @@ const App: FC = () => {
               />
             </div>
           )}
-          {/* Book panel — chart stays behind, drawer slides over */}
+
           {mobilePanel === "book" && (
             <div
               style={{
@@ -284,10 +348,10 @@ const App: FC = () => {
                 minHeight: 0,
               }}
             >
-              <CandleChart market={market} positions={positions} />
+              <CandleChart market={market} />
             </div>
           )}
-          {/* Markets panel — full screen market switcher */}
+
           {mobilePanel === "markets" && (
             <div style={{ width: "100%", minHeight: 0, overflow: "hidden" }}>
               <MarketsPanel
@@ -300,7 +364,7 @@ const App: FC = () => {
               />
             </div>
           )}
-          {/* Positions panel — fully replaces everything */}
+
           {mobilePanel === "positions" && !showDrawer && (
             <div style={{ width: "100%", minHeight: 0, overflow: "hidden" }}>
               <PositionsPanel
@@ -310,13 +374,13 @@ const App: FC = () => {
               />
             </div>
           )}
-          {/* Portfolio panel */}
+
           {mobilePanel === "portfolio" && (
             <div style={{ width: "100%", minHeight: 0, overflow: "auto" }}>
               <PortfolioPanel positions={positions} />
             </div>
           )}
-          {/* History panel */}
+
           {mobilePanel === "history" && (
             <div style={{ width: "100%", minHeight: 0, overflow: "auto" }}>
               <HistoryPanel closedTrades={closedTrades} />
@@ -332,7 +396,7 @@ const App: FC = () => {
       />
       <StatsBar positions={positions} />
 
-      {showDrawer && !isDesktop && (
+      {showDrawer && (
         <>
           <div
             className="drawer-backdrop"
