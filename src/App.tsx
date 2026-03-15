@@ -19,7 +19,6 @@ import MarketsPanel from "@/components/MarketsPanel";
 
 import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
-import { PublicKey } from "@solana/web3.js";
 import * as anchor from "@coral-xyz/anchor";
 
 import type {
@@ -38,11 +37,6 @@ const PYTH_TO_MARKET: Record<string, string> = {
   [PYTH_IDS.JUP.replace("0x", "")]: "JUP",
   [PYTH_IDS.WIF.replace("0x", "")]: "WIF",
 };
-
-const PROGRAM_ID = new PublicKey(
-  import.meta.env.VITE_PROGRAM_ID ??
-    "8RK5m1rte3iKwJ2eJxoLXaxMmYyq3moAaTov72KqtgdG",
-);
 
 const App: FC = () => {
   const pythPrices = usePythPrices();
@@ -98,16 +92,6 @@ const App: FC = () => {
 
   const handleWalletToggle = () =>
     wallet.connected ? wallet.disconnect() : setVisible(true);
-
-  const toU64LE = (n: number): Uint8Array => {
-    const buf = new Uint8Array(8);
-    let val = BigInt(n);
-    for (let i = 0; i < 8; i++) {
-      buf[i] = Number(val & 0xffn);
-      val >>= 8n;
-    }
-    return buf;
-  };
 
   // Always build a fresh provider from current wallet + connection
   const getProvider = useCallback(
